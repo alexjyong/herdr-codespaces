@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+# Register GitHub Codespaces as herdr SSH machines. Works as a herdr plugin or from a plain shell.
+set -euo pipefail
+
+H="${HERDR_BIN_PATH:-herdr}"
+CFG_REF="~/.ssh/codespaces"                 # as written in ~/.ssh/config's Include line
+CFG="$HOME/.ssh/codespaces"
+KH_REF="~/.ssh/codespaces_known_hosts"      # as written in the ssh config
+KH="$HOME/.ssh/codespaces_known_hosts"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# --- pure helpers (sourced by test/smoke.sh) ---
+
+# stdin -> stdout: ssh config minus the block for codespace $1
+drop_block() {
+  awk -v h="Host herdr-cs.$1" 'index($0,"Host ")==1{skip=($0==h)} !skip'
+}
+
+# stdin -> stdout: `gh codespace ssh --config` output with a stable alias, a real known_hosts,
+# and the ProxyCommand routed through `$3 guard` so reconnects can't wake a stopped codespace
+# ponytail: $3 is spliced unquoted into ProxyCommand; breaks if the plugin path has spaces
+patch_config() {
+  sed -e "s#^Host .*#Host herdr-cs.$1#" \
+      -e "s#^\([[:space:]]*ProxyCommand \)#\1$3 guard $1 #" \
+      -e "s#UserKnownHostsFile=/dev/null#UserKnownHostsFile $2#" \
+      -e 's#StrictHostKeyChecking no#StrictHostKeyChecking accept-new#'
+}
+
+# prepend "Include $2" to ssh config $1 unless present (backup to $1.bak)
+ensure_include() {
+  local cfg=$1 inc="Include $2"
+  touch "$cfg"
+  grep -qxF "$inc" "$cfg" && return 0
+  cp "$cfg" "$cfg.bak"
+  { echo "$inc"; cat "$cfg.bak"; } > "$cfg"
+  chmod 600 "$cfg"
+}
+
+# stdin: `herdr machine list --json`; prints "id<TAB>label" for codespace $1
+# ponytail: line-based JSON parse (no jq); relies on herdr's pretty output with id, label, target in order
+machine_for() {
+  awk -F'"' -v t="herdr-cs.$1" '$2=="id"{id=$4} $2=="label"{l=$4} $2=="target" && $4==t{print id "\t" l; exit}'
+}
+
+# stdin: `herdr machine list --json`; prints "label<TAB>codespace" for every herdr-cs.* machine
+registered() {
+  awk -F'"' '$2=="label"{l=$4} $2=="target" && index($4,"herdr-cs.")==1{print l "\t" substr($4,10)}'
+}
+
+# --- impure ---
+
+machines() { "$H" machine list --json < /dev/null; }
+
+codespaces() {
+  gh codespace list --json name,repository,state,gitStatus \
+    --jq '.[] | [.name,.repository,.state,.gitStatus.ref] | @tsv'
+}
+
+# stdin rows -> the chosen row; fzf if available, else bash select
+choose() {
+  if command -v fzf > /dev/null; then fzf --delimiter='\t' --header="$1"; return; fi
+  local IFS=$'\n' r rows; rows=$(cat)
+  echo "$1" >&2
+  select r in $rows; do [[ -n $r ]] && { echo "$r"; return; }; done < /dev/tty
+  return 1
+}
+
+pick() {
+  local rows; rows=$(codespaces)
+  [[ -n $rows ]] || die "no codespaces (gh codespace list)"
+  choose "$1" <<<"$rows" | cut -f1
+}
+
+ask() { local a; read -rp "$1 [y/N] " a; [[ $a == [yY]* ]]; }
+
+link_herdr() {
+  ssh -n "$1" '[ -x ~/.local/bin/herdr ] && sudo ln -sf ~/.local/bin/herdr /usr/local/bin/herdr; true'
+}
+
+# herdr panes are non-login shells, so /etc/profile.d/codespaces.sh never runs: no GITHUB_TOKEN (git auth)
+# and no cd into the repo. (Re)write a managed block in the remote ~/.bashrc that does both.
+remote_bashrc() {
+  ssh "$1" 'sed -i "/^# >>> herdr-codespaces/,/^# <<< herdr-codespaces/d" ~/.bashrc; cat >> ~/.bashrc' <<'SNIPPET'
+# >>> herdr-codespaces (managed by the herdr-codespaces plugin; rewritten on add/refresh)
+if [ -n "$HERDR_ENV" ]; then
+  if [ -z "$GITHUB_TOKEN" ] && [ -r /workspaces/.codespaces/shared/.env-secrets ]; then
+    while IFS= read -r line; do export "${line%%=*}=$(printf %s "${line#*=}" | base64 -d)"; done < /workspaces/.codespaces/shared/.env-secrets
+  fi
+  if [ "$PWD" = "$HOME" ]; then
+    d=$(sed -n 's/^WORKING_DIRECTORY="\(.*\)"$/\1/p' /etc/profile.d/codespaces.sh 2>/dev/null)
+    [ -d "$d" ] && cd "$d"
+    unset d
+  fi
+fi
+# <<< herdr-codespaces
+SNIPPET
+}
+
+cmd_add() {
+  local name=${1:-} label=${2:-} id="" old_label=""
+  [[ -n $name ]] || name=$(pick "add which codespace?") || exit 1
+  local alias="herdr-cs.$name"
+  IFS=$'\t' read -r id old_label < <(machines | machine_for "$name") || true
+  label=${label:-${old_label:-${name%-*}}}
+
+  echo "==> ssh config ($CFG)"
+  mkdir -p ~/.ssh; touch "$CFG"; chmod 600 "$CFG"
+  local fresh; fresh=$(gh codespace ssh -c "$name" --config | patch_config "$name" "$KH_REF" "$SELF")
+  grep -qx "Host $alias" <<<"$fresh" || die "gh generated no ssh config for $name"
+  { drop_block "$name" < "$CFG"; echo "$fresh"; echo; } > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"
+  ensure_include ~/.ssh/config "$CFG_REF"
+
+  echo "==> connecting to $alias (starts the codespace if needed)"
+  touch "$KH"
+  ssh-keygen -R "$alias" -f "$KH" > /dev/null 2>&1 || true
+  HERDR_CS_WAKE=1 ssh -n "$alias" true
+  link_herdr "$alias"
+  remote_bashrc "$alias"
+
+  if [[ -n $id ]]; then
+    echo "==> already registered as herdr machine '$old_label'"
+  else
+    echo "==> herdr machine add --label $label $alias"
+    "$H" machine add --label "$label" "$alias"   # interactive: may offer to install herdr remotely
+    link_herdr "$alias"
+  fi
+
+  # offer the Claude integration only if claude is set up remotely and the integration isn't current
+  local ci; ci=$(ssh -n "$alias" '[ -d ~/.claude ] && herdr integration status 2>/dev/null | grep "^claude:"' || true)
+  case $ci in
+    "") ;;                                   # no ~/.claude: nothing to integrate with
+    *": current"*) echo "==> Claude integration already current" ;;
+    *) if [[ -t 0 ]] && ask "Claude integration is ${ci#claude: } in $name; install/update it?"; then
+         ssh -n "$alias" 'herdr integration install claude'
+       fi ;;
+  esac
+  echo "done: $label -> $alias"
+}
+
+cmd_list() {
+  local m name repo state ref
+  m=$(machines)
+  while IFS=$'\t' read -r name repo state ref; do
+    printf '%-40s %-30s %-10s %-30s %s\n' "$name" "$repo" "$state" "$ref" \
+      "$(machine_for "$name" <<<"$m" | cut -f2)"
+  done < <(codespaces)
+}
+
+cmd_remove() {
+  local name=${1:-} id="" label=""
+  [[ -n $name ]] || name=$(pick "remove which codespace from herdr?") || exit 1
+  IFS=$'\t' read -r id label < <(machines | machine_for "$name") || true
+  [[ -n $id ]] && { "$H" machine remove "$id" < /dev/null; echo "removed herdr machine '$label'"; }
+  if [[ -f $CFG ]]; then drop_block "$name" < "$CFG" > "$CFG.tmp" && mv "$CFG.tmp" "$CFG"; fi
+  ssh-keygen -R "herdr-cs.$name" -f "$KH" > /dev/null 2>&1 || true
+  echo "removed ssh config for $name (codespace itself untouched)"
+}
+
+cmd_stop() {
+  local name=${1:-}
+  [[ -n $name ]] || name=$(pick "stop which codespace?") || exit 1
+  gh codespace stop -c "$name"
+}
+
+state() { gh codespace view -c "$1" --json state -q .state < /dev/null 2>/dev/null || echo unknown; }
+
+# ProxyCommand wrapper: only connect to a running codespace, unless HERDR_CS_WAKE is set (add/refresh)
+cmd_guard() {
+  local name=$1; shift
+  if [[ -z ${HERDR_CS_WAKE:-} ]]; then
+    local s; s=$(state "$name")
+    [[ $s == Available ]] || { echo "herdr-codespaces: $name is $s; not waking it (use refresh)" >&2; exit 1; }
+  fi
+  exec "$@"
+}
+
+# stop registered codespaces once the Mac has had no keyboard/mouse input for N minutes,
+# skipping any codespace with a working agent
+# ponytail: macOS-only idle source (ioreg HIDIdleTime); add xprintidle etc. if linux matters
+cmd_idle_stop() {
+  local limit=$(( ${1:-60} * 60 )) idle label name
+  idle=$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ && !d {print int($NF/1e9); d=1}')
+  (( idle >= limit )) || return 0
+  while IFS=$'\t' read -r label name; do
+    [[ $(state "$name") == Available ]] || continue
+    "$H" --machine "$label" workspace list < /dev/null 2>/dev/null | grep -q '"agent_status":"working"' && continue
+    echo "$(date '+%F %T') idle $((idle / 60))m: stopping $name"
+    gh codespace stop -c "$name" < /dev/null
+  done < <(machines | registered)
+}
+
+PLIST="$HOME/Library/LaunchAgents/dev.herdr.codespaces.autostop.plist"
+
+# install/remove a launchd job that runs idle-stop every 5 minutes
+cmd_autostop() {
+  launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
+  case ${1:-} in
+    off) rm -f "$PLIST"; echo "autostop off" ;;
+    on)
+      local mins=${2:-60} herdr path
+      herdr=$(command -v "$H") || die "herdr not found"
+      path="$(dirname "$(command -v gh)"):$(dirname "$herdr"):/usr/bin:/bin:/usr/sbin"
+      mkdir -p "$(dirname "$PLIST")"
+      cat > "$PLIST" <<PL
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.herdr.codespaces.autostop</string>
+  <key>ProgramArguments</key><array><string>$SELF</string><string>idle-stop</string><string>$mins</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$path</string>
+    <key>HERDR_BIN_PATH</key><string>$herdr</string>
+  </dict>
+  <key>StartInterval</key><integer>300</integer>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/herdr-codespaces.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/herdr-codespaces.log</string>
+</dict></plist>
+PL
+      launchctl bootstrap "gui/$(id -u)" "$PLIST"
+      echo "autostop on: stops idle codespaces after ${mins}m of no input (log: ~/Library/Logs/herdr-codespaces.log)" ;;
+    *) die "usage: autostop on [minutes] | off" ;;
+  esac
+}
+
+cmd_menu() {
+  local c
+  c=$(printf '%s\n' add refresh remove stop list | choose "codespaces") || exit 0
+  "cmd_${c/refresh/add}"
+}
+
+main() {
+  case ${1:-} in
+    add|refresh) shift; cmd_add "$@" ;;
+    list) cmd_list ;;
+    remove) shift; cmd_remove "$@" ;;
+    stop) shift; cmd_stop "$@" ;;
+    guard) shift; cmd_guard "$@" ;;
+    idle-stop) shift; cmd_idle_stop "$@" ;;
+    autostop) shift; cmd_autostop "$@" ;;
+    menu) trap 'echo; read -rsn1 -p "press any key to close" || true' EXIT; cmd_menu ;;
+    *) echo "usage: herdr-codespaces add|refresh|remove|stop [name] [label] | list | menu | autostop on [min]|off"; exit 2 ;;
+  esac
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

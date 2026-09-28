@@ -1,0 +1,20 @@
+id = "alexjyong.codespaces"
+name = "GitHub Codespaces"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Register GitHub Codespaces as herdr SSH machines"
+platforms = ["macos", "linux"]
+
+[[panes]]
+id = "manage"
+title = "Codespaces"
+placement = "popup"
+width = "80%"
+height = "60%"
+command = ["bin/herdr-codespaces", "menu"]
+
+[[actions]]
+id = "open"
+title = "Codespaces menu"
+contexts = ["workspace"]
+command = ["sh", "-c", "exec \"$HERDR_BIN_PATH\" plugin pane open --plugin \"$HERDR_PLUGIN_ID\" --entrypoint manage"]
