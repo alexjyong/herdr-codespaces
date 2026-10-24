@@ -54,24 +54,28 @@ registered() {
 machines() { "$H" machine list --json < /dev/null; }
 
 codespaces() {
-  gh codespace list --json name,repository,state,gitStatus \
-    --jq '.[] | [.name,.repository,.state,.gitStatus.ref] | @tsv'
+  gh codespace list --json name,displayName,repository,state,gitStatus \
+    --jq '.[] | [.name,.displayName,.repository,.state,.gitStatus.ref] | @tsv'
 }
 
-# stdin rows -> the chosen row; fzf if available, else bash select
+# stdin rows -> the chosen row; fzf (extra args passed through) if available, else bash select
 choose() {
-  if command -v fzf > /dev/null; then fzf --delimiter='\t' --header="$1"; return; fi
+  local header=$1; shift
+  if command -v fzf > /dev/null; then fzf --delimiter='\t' --header="$header" "$@"; return; fi
   local IFS=$'\n' r rows; rows=$(cat)
-  echo "$1" >&2
+  echo "$header" >&2
   select r in $rows; do [[ -n $r ]] && { echo "$r"; return; }; done < /dev/tty
   return 1
 }
 
-pick() {
+# codespace rows -> chosen row, showing GitHub display names instead of the generated codespace names
+choose_codespace() {
   local rows; rows=$(codespaces)
   [[ -n $rows ]] || die "no codespaces (gh codespace list)"
-  choose "$1" <<<"$rows" | cut -f1
+  choose "$1" --with-nth=2.. <<<"$rows"
 }
+
+pick() { choose_codespace "$1" | cut -f1; }
 
 ask() { local a; read -rp "$1 [y/N] " a; [[ $a == [yY]* ]]; }
 
@@ -80,11 +84,21 @@ link_herdr() {
 }
 
 # herdr panes are non-login shells, so /etc/profile.d/codespaces.sh never runs: no GITHUB_TOKEN (git auth)
-# and no cd into the repo. (Re)write a managed block in the remote ~/.bashrc that does both.
+# and no cd into the repo; nor does ~/.profile, where installers put PATH (~/.local/bin, cargo, elan,
+# nix): tools installed there are missing. (Re)write a managed block in the remote ~/.bashrc that does
+# all three. (Not login shells instead: codespaces.sh would cd every new pane into the repo.)
 remote_bashrc() {
   ssh "$1" 'sed -i "/^# >>> herdr-codespaces/,/^# <<< herdr-codespaces/d" ~/.bashrc; cat >> ~/.bashrc' <<'SNIPPET'
 # >>> herdr-codespaces (managed by the herdr-codespaces plugin; rewritten on add/refresh)
 if [ -n "$HERDR_ENV" ]; then
+  # ~/.profile includes this file again: the guard stops it there
+  if [ -z "$HERDR_CS_PROFILE" ] && [ -r "$HOME/.profile" ]; then
+    export HERDR_CS_PROFILE=1
+    . "$HOME/.profile"
+  fi
+  # Everything under /workspaces is world-writable: ls would draw every folder blue on green
+  # (dircolors' ow/tw), unreadable in most themes. Draw them as plain folders.
+  [ -n "$LS_COLORS" ] && export LS_COLORS="$LS_COLORS:ow=01;34:tw=01;34"
   if [ -z "$GITHUB_TOKEN" ] && [ -r /workspaces/.codespaces/shared/.env-secrets ]; then
     while IFS= read -r line; do export "${line%%=*}=$(printf %s "${line#*=}" | base64 -d)"; done < /workspaces/.codespaces/shared/.env-secrets
   fi
@@ -103,7 +117,8 @@ cmd_add() {
   [[ -n $name ]] || name=$(pick "add which codespace?") || exit 1
   local alias="herdr-cs.$name"
   IFS=$'\t' read -r id old_label < <(machines | machine_for "$name") || true
-  label=${label:-${old_label:-${name%-*}}}
+  label=${label:-${old_label:-$(gh codespace view -c "$name" --json displayName -q .displayName < /dev/null)}}
+  label=${label:-${name%-*}}
 
   echo "==> ssh config ($CFG)"
   mkdir -p ~/.ssh; touch "$CFG"; chmod 600 "$CFG"
@@ -120,7 +135,8 @@ cmd_add() {
   remote_bashrc "$alias"
 
   if [[ -n $id ]]; then
-    echo "==> already registered as herdr machine '$old_label'"
+    echo "==> already registered as herdr machine '$old_label'; reconnecting open herdr clients"
+    reconnect_clients "$id" "$alias" || echo "warning: herdr can't reach '$old_label' yet; clients keep retrying"
   else
     echo "==> herdr machine add --label $label $alias"
     "$H" machine add --label "$label" "$alias"   # interactive: may offer to install herdr remotely
@@ -140,10 +156,10 @@ cmd_add() {
 }
 
 cmd_list() {
-  local m name repo state ref
+  local m name display repo state ref
   m=$(machines)
-  while IFS=$'\t' read -r name repo state ref; do
-    printf '%-40s %-30s %-10s %-30s %s\n' "$name" "$repo" "$state" "$ref" \
+  while IFS=$'\t' read -r name display repo state ref; do
+    printf '%-25s %-40s %-30s %-10s %-30s %s\n' "$display" "$name" "$repo" "$state" "$ref" \
       "$(machine_for "$name" <<<"$m" | cut -f2)"
   done < <(codespaces)
 }
@@ -166,22 +182,112 @@ cmd_stop() {
 
 state() { gh codespace view -c "$1" --json state -q .state < /dev/null 2>/dev/null || echo unknown; }
 
+# Whether herdr can reach machine $1 (ssh target $2). herdr before `machine status` (0.9.1 has none:
+# it prints its usage and fails, every time) is asked through ssh instead.
+reachable() {
+  if "$H" machine status --help < /dev/null > /dev/null 2>&1; then
+    "$H" machine status "$1" < /dev/null > /dev/null 2>&1
+  else
+    ssh -n -o ConnectTimeout=10 -o BatchMode=yes "$2" true > /dev/null 2>&1
+  fi
+}
+
+# Open herdr clients back off to 2 minutes between attempts while a codespace is stopped, and nothing
+# makes them retry sooner once it's up. Warm herdr's shared ssh master with `machine status` (up to
+# 2 minutes), then disable+enable the machine: clients replace it with a fresh endpoint that connects
+# immediately through the warm master. Fails if the machine never became reachable.
+reconnect_clients() {
+  local id=$1 alias=$2 i ok=1
+  for (( i = 0; i < 24; i++ )); do
+    reachable "$id" "$alias" && { ok=0; break; }
+    sleep 5
+  done
+  "$H" machine disable "$id" < /dev/null > /dev/null
+  sleep 2   # clients poll the machine catalog once a second; they must see the disable
+  "$H" machine enable "$id" < /dev/null > /dev/null
+  return $ok
+}
+
+cmd_start() {
+  local name=${1:-} id="" label="" i
+  [[ -n $name ]] || name=$(pick "start which codespace?") || exit 1
+  [[ $name =~ ^[A-Za-z0-9-]+$ ]] || die "invalid codespace name: $name"
+  echo "==> starting $name (takes about a minute)"
+  gh api -X POST "/user/codespaces/$name/start" > /dev/null
+  for (( i = 0; i < 60; i++ )); do
+    [[ $(state "$name") == Available ]] && break
+    sleep 5
+  done
+  [[ $(state "$name") == Available ]] || die "$name did not become available; check gh codespace list"
+  IFS=$'\t' read -r id label < <(machines | machine_for "$name") || true
+  if [[ -z $id ]]; then echo "started $name"; return; fi
+  echo "==> reconnecting herdr machine '$label'"
+  if reconnect_clients "$id" "herdr-cs.$name"; then
+    echo "started $name; open herdr clients reconnect to '$label' now"
+  else
+    echo "started $name; herdr can't reach '$label' yet, open clients keep retrying"
+  fi
+}
+
+cmd_toggle() {
+  local row name display repo s
+  row=$(choose_codespace "start/stop which codespace?") || exit 1
+  IFS=$'\t' read -r name display repo s _ <<<"$row"
+  case $s in
+    Available) echo "==> stopping $display ($name)"; cmd_stop "$name" ;;
+    Shutdown) cmd_start "$name" ;;
+    *) die "$display is $s; try again once it settles" ;;
+  esac
+}
+
 # ProxyCommand wrapper: only connect to a running codespace, unless HERDR_CS_WAKE is set (add/refresh)
 cmd_guard() {
   local name=$1; shift
   if [[ -z ${HERDR_CS_WAKE:-} ]]; then
     local s; s=$(state "$name")
-    [[ $s == Available ]] || { echo "herdr-codespaces: $name is $s; not waking it (use refresh)" >&2; exit 1; }
+    [[ $s == Available ]] || { echo "herdr-codespaces: $name is $s; not waking it (use start or refresh)" >&2; exit 1; }
   fi
   exec "$@"
 }
 
-# stop registered codespaces once the Mac has had no keyboard/mouse input for N minutes,
+WIN_IDLE_PS='$ProgressPreference = "SilentlyContinue"
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class HerdrCsIdle {
+  [StructLayout(LayoutKind.Sequential)] struct LastInput { public uint Size; public uint Time; }
+  [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LastInput info);
+  public static uint Seconds() {
+    var info = new LastInput { Size = 8 };
+    GetLastInputInfo(ref info);
+    return unchecked((uint)Environment.TickCount - info.Time) / 1000;
+  }
+}
+"@
+[HerdrCsIdle]::Seconds()'
+
+idle_seconds() {
+  case $(uname -s) in
+    Darwin) ioreg -c IOHIDSystem | awk '/HIDIdleTime/ && !d {print int($NF/1e9); d=1}' ;;
+    Linux)
+      if grep -qi microsoft /proc/version 2>/dev/null && command -v powershell.exe > /dev/null; then
+        powershell.exe -NoProfile -NonInteractive -EncodedCommand \
+          "$(printf %s "$WIN_IDLE_PS" | iconv -f utf-8 -t utf-16le | base64 -w0)" < /dev/null 2>/dev/null | tr -d '\r'
+      elif command -v xprintidle > /dev/null; then
+        echo $(( $(xprintidle) / 1000 ))
+      else
+        die "no idle time source: install xprintidle (X11) or run under WSL"
+      fi ;;
+    *) die "idle detection is not supported on $(uname -s)" ;;
+  esac
+}
+
+# stop registered codespaces once there has been no keyboard/mouse input for N minutes,
 # skipping any codespace with a working agent
-# ponytail: macOS-only idle source (ioreg HIDIdleTime); add xprintidle etc. if linux matters
 cmd_idle_stop() {
   local limit=$(( ${1:-60} * 60 )) idle label name
-  idle=$(ioreg -c IOHIDSystem | awk '/HIDIdleTime/ && !d {print int($NF/1e9); d=1}')
+  idle=$(idle_seconds)
+  [[ $idle =~ ^[0-9]+$ ]] || die "could not read idle time: '$idle'"
   (( idle >= limit )) || return 0
   while IFS=$'\t' read -r label name; do
     [[ $(state "$name") == Available ]] || continue
@@ -193,8 +299,67 @@ cmd_idle_stop() {
 
 PLIST="$HOME/Library/LaunchAgents/dev.herdr.codespaces.autostop.plist"
 
-# install/remove a launchd job that runs idle-stop every 5 minutes
 cmd_autostop() {
+  case $(uname -s) in
+    Darwin) autostop_launchd "$@" ;;
+    Linux) autostop_systemd "$@" ;;
+    *) die "autostop is not supported on $(uname -s)" ;;
+  esac
+}
+
+UNIT_DIR="$HOME/.config/systemd/user"
+UNIT=herdr-codespaces-autostop
+
+autostop_systemd() {
+  if [[ -f $UNIT_DIR/$UNIT.timer ]]; then
+    systemctl --user disable --now "$UNIT.timer" 2>/dev/null || true
+  fi
+  case ${1:-} in
+    off)
+      rm -f "$UNIT_DIR/$UNIT.service" "$UNIT_DIR/$UNIT.timer"
+      systemctl --user daemon-reload
+      echo "autostop off" ;;
+    on)
+      local mins=${2:-60} herdr path display=""
+      [[ $mins =~ ^[0-9]+$ ]] || die "minutes must be a number"
+      herdr=$(command -v "$H") || die "herdr not found"
+      path="$(dirname "$(command -v gh)"):$(dirname "$herdr")"
+      if command -v powershell.exe > /dev/null; then path+=":$(dirname "$(command -v powershell.exe)")"; fi
+      path+=":/usr/local/bin:/usr/bin:/bin"
+      [[ -n ${DISPLAY:-} ]] && display="Environment=\"DISPLAY=$DISPLAY\""
+      idle_seconds > /dev/null
+      mkdir -p "$UNIT_DIR"
+      cat > "$UNIT_DIR/$UNIT.service" <<UNIT
+[Unit]
+Description=Stop GitHub Codespaces registered in herdr after ${mins}m without keyboard/mouse input
+
+[Service]
+Type=oneshot
+Environment="PATH=$path"
+Environment="HERDR_BIN_PATH=$herdr"
+$display
+ExecStart="$SELF" idle-stop $mins
+UNIT
+      cat > "$UNIT_DIR/$UNIT.timer" <<UNIT
+[Unit]
+Description=Check every 5 minutes for idle GitHub Codespaces registered in herdr
+
+[Timer]
+OnStartupSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+UNIT
+      systemctl --user daemon-reload
+      systemctl --user enable --now "$UNIT.timer"
+      echo "autostop on: stops idle codespaces after ${mins}m of no input (log: journalctl --user -u $UNIT)" ;;
+    *) die "usage: autostop on [minutes] | off" ;;
+  esac
+}
+
+# install/remove a launchd job that runs idle-stop every 5 minutes
+autostop_launchd() {
   launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
   case ${1:-} in
     off) rm -f "$PLIST"; echo "autostop off" ;;
@@ -226,7 +391,7 @@ PL
 
 cmd_menu() {
   local c
-  c=$(printf '%s\n' add refresh remove stop list | choose "codespaces") || exit 0
+  c=$(printf '%s\n' toggle add refresh remove start stop list | choose "codespaces") || exit 0
   "cmd_${c/refresh/add}"
 }
 
@@ -236,11 +401,13 @@ main() {
     list) cmd_list ;;
     remove) shift; cmd_remove "$@" ;;
     stop) shift; cmd_stop "$@" ;;
+    start) shift; cmd_start "$@" ;;
+    toggle) cmd_toggle ;;
     guard) shift; cmd_guard "$@" ;;
     idle-stop) shift; cmd_idle_stop "$@" ;;
     autostop) shift; cmd_autostop "$@" ;;
     menu) trap 'echo; read -rsn1 -p "press any key to close" || true' EXIT; cmd_menu ;;
-    *) echo "usage: herdr-codespaces add|refresh|remove|stop [name] [label] | list | menu | autostop on [min]|off"; exit 2 ;;
+    *) echo "usage: herdr-codespaces add|refresh|remove|start|stop [name] [label] | toggle | list | menu | autostop on [min]|off"; exit 2 ;;
   esac
 }
 
